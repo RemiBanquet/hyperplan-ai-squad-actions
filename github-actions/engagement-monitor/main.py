@@ -137,6 +137,12 @@ def discover_campaigns(cfg: Dict[str, Any], api_key: str) -> List[Dict[str, Any]
             for c in page:
                 name = c.get("name") or ""
                 cid = c.get("_id") or c.get("id") or ""
+                # Skip archived campaigns: Lemlist's listing returns them
+                # (found 2026-06-09: an archived Wave 0 test campaign with an
+                # A4- prefix landed in scope). Field name varies, check all.
+                if (c.get("archived") or c.get("isArchived")
+                        or c.get("status") == "archived"):
+                    continue
                 if cid and name.startswith(prefixes):
                     discovered.append({"id": cid, "name": name, "account": ""})
             if len(page) < 100:
