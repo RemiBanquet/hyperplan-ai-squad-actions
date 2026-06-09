@@ -64,9 +64,17 @@ def load_config() -> Dict[str, Any]:
 
 # --------- HTTP helpers (stdlib only) ---------
 
+USER_AGENT = "Mozilla/5.0 (compatible; hyperplan-ai-squad-agent5/1.0; +https://hyperplan.ag)"
+
+
 def _request(url: str, headers: Dict[str, str], method: str = "GET",
              payload: Optional[Dict[str, Any]] = None, retries: int = 2) -> Any:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    # Cloudflare blocks urllib's default "Python-urllib/x.y" UA with error
+    # 1010 (seen on every Lemlist call from GitHub runners, 2026-06-09).
+    headers = dict(headers)
+    headers.setdefault("User-Agent", USER_AGENT)
+    headers.setdefault("Accept", "application/json")
     last = None
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
