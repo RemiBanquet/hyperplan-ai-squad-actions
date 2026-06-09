@@ -1,0 +1,53 @@
+# Agent 5 Engagement Monitor, always-on triage.
+# Copy this file to .github/workflows/agent5-monitor.yml in the deployment repo.
+#
+# Policy (Rémi rulings 2026-06-09): triage + alert ONLY. Never drafts,
+# never sends, never pauses anything. Squad campaigns only (config.json).
+name: agent5-engagement-monitor
+
+on:
+  schedule:
+    # Every 4 hours. Cron is UTC: 06/10/14/18/22/02 UTC covers French
+    # business hours + nights + weekends (the gap the Cowork sweep leaves).
+    - cron: "0 2,6,10,14,18,22 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no Notion writes, no Telegram)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent5-monitor
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # stdlib only, no pip install needed
+
+      - name: Selftest (classification logic)
+        run: python3 github-actions/engagement-monitor/classify.py --selftest
+
+      - name: Run triage
+        env:
+          LEMLIST_API_KEY: ${{ secrets.LEMLIST_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOKBACK_HOURS: "6"
+        run: |
+          python3 github-actions/engagement-monitor/main.py \
+            ${{ inputs.dry_run && '--dry-run' || '' }}

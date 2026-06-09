@@ -1,0 +1,28 @@
+{
+  "_comment": "Agent 5 always-on triage scope. Squad campaigns ONLY (Rémi ruling 2026-06-09). Scope = auto-discovery by campaign_name_prefixes (A3-*/A4-*, the Agent 3/4 naming convention) MERGED with the static list below. New waves are picked up automatically; the static list is the fallback if the Lemlist campaign-listing call fails, plus any campaign that needs monitoring despite an off-convention name. activity_field_map exists because Lemlist /activities payload field names must be verified on the first --dry-run; adjust the map, not the code.",
+  "campaign_name_prefixes": ["A3-", "A4-"],
+  "campaigns": [
+    {"id": "cam_6tiKEwJzqbxxpP5yA", "name": "A3-2026-05-13-001 C1 | Yara EU bridge anchor", "account": "Yara"},
+    {"id": "cam_RqREtMk2a4JSSHZNC", "name": "A3-2026-05-13-001 C2 | Yara EU country MD", "account": "Yara"},
+    {"id": "cam_c7u5LrcHRcjWZAqYZ", "name": "A3-2026-05-13-001 C3 | Yara EU digital commercial", "account": "Yara"},
+    {"id": "cam_RwDhKDzoDuybQL3BJ", "name": "A3-2026-05-13-001 C4 | Yara EU marketing mid", "account": "Yara"},
+    {"id": "cam_B4ro7dt4DorYsWxN7", "name": "A3-2026-05-13-001 C5 | Yara Latam senior", "account": "Yara"},
+    {"id": "cam_Pg3anZnvft5m5k9Ni", "name": "A3-2026-05-13-001 C6 | Yara Latam marketing BI", "account": "Yara"},
+    {"id": "cam_zhf2Fni4G6P2b4pgc", "name": "A3-2026-05-13-001 C7 | Yara South Africa", "account": "Yara"},
+    {"id": "cam_SJSTDqb5rHZZZfvon", "name": "A3-2026-05-13-001 C8 | Yara Egypt", "account": "Yara"}
+  ],
+  "reply_activity_types": ["emailsReplied", "linkedinReplied"],
+  "replies_db": "6bb74464336b47cda706c873442fcf66",
+  "leads_db": "8c3f6f4524244b529f4d024d5d8801a9",
+  "improvement_log_db": "7664a2a7538249b699a6c3db82d136a6",
+  "synthetic_prefix": "R-2026-05-19",
+  "competitor_names": ["OneSoil", "Constellr", "Digifarm"],
+  "activity_field_map": {
+    "id": "_id",
+    "lead_email": "leadEmail",
+    "lead_name": "leadFirstName",
+    "lead_last_name": "leadLastName",
+    "text": "text",
+    "date": "createdAt"
+  }
+}
