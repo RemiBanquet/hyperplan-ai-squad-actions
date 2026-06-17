@@ -36,6 +36,13 @@ The spec's cutover warning ("never two systems doing the same triage") is satisf
 - Classification keyword changes: edit `classify.py` lists AND `agents/agent5-engagement-monitor/references/classification-rules.md` together; the reference file stays canonical. Run `python3 classify.py --selftest` (20 checks) before pushing.
 - Cost: ~1 Haiku call per new reply. At current volume this is cents per month.
 
+## Body extraction (IL-36, added 2026-06-12)
+
+The first live reply arrived as Outlook-mobile HTML with no usable plain-text field; the runner stored a blank body and misclassified it Ambiguous. `main.py` now extracts in 3 layers: every known body field on the activity payload (`text`, `body`, `message`, `bodyHtml`, ...) → HTML-to-text + quoted-history strip → inbox-conversation fetch as last resort. A blank after all 3 writes the row WITHOUT a Classification bucket, reasoning = "extraction-failed, needs manual fetch". The `Telegram alert sent` checkbox is now set in the same pass that sends an alert (Critical immediately, run-summary rows after the summary send succeeds).
+
+- Golden test (no network): `python3 main.py --selftest`. Runs against `fixtures/outlook-mobile-reply.html`, the EXACT live payload of act_RTXdot9Twnih7jzYz fetched from the Lemlist conversation on 2026-06-12. Run it together with `classify.py --selftest` before any push.
+- VERIFY ON FIRST LIVE USE: the inbox-fallback REST paths (`/inbox/conversations/{ctc_id}`) mirror the MCP `get_inbox_conversation` shape but are unverified against public docs. Failure is safe (degrades to extraction-failed), but if a row lands extraction-failed while the conversation clearly has a body, fix the path here.
+
 ## Not built yet (deliberate)
 
 - Drafting in the Action (spec step 3): needs brand voice + response playbook + Layer 2 in-repo. Add only if the Cowork drafting cadence becomes the bottleneck.

@@ -41,12 +41,14 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
 
 from classify import classify, Classification
@@ -107,6 +109,145 @@ def notion_headers(token: str) -> Dict[str, str]:
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
+
+
+# --------- Reply body extraction (IL-36) ---------
+# The first live reply (act_RTXdot9Twnih7jzYz, 2026-06-11) arrived as
+# Outlook-mobile HTML with no usable plain-text field; the runner stored an
+# empty body and classify() bucketed blank content as Ambiguous. Fix, 3
+# layers: (1) try every known body field on the activity payload, (2)
+# convert HTML to text (stdlib HTMLParser) and strip quoted history, (3) if
+# still empty, fetch the conversation from the inbox API. A blank result
+# after all 3 is an EXTRACTION FAILURE, not a classification: the row is
+# written without a bucket and marked for manual fetch.
+# Golden test: python3 main.py --selftest (fixtures/outlook-mobile-reply.html
+# is the exact live payload).
+
+BODY_FIELD_CANDIDATES = ["text", "body", "message", "bodyHtml", "html", "content", "snippet"]
+
+QUOTE_MARKERS = [
+    re.compile(r"^\s*From:\s.+$", re.IGNORECASE),
+    re.compile(r"^\s*-{3,}\s*Original Message\s*-{3,}", re.IGNORECASE),
+    re.compile(r"^\s*On .{4,140} wrote:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Le .{4,140} a écrit\s*:\s*$", re.IGNORECASE),
+]
+
+
+class _HTMLText(HTMLParser):
+    SKIP = {"style", "script", "head", "title"}
+    BREAKS = {"br", "p", "div", "tr", "li", "blockquote", "hr", "table"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag in self.BREAKS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        elif tag in self.BREAKS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(raw: str) -> str:
+    """HTML to plain text. Non-HTML strings pass through untouched."""
+    if "<" not in raw or ">" not in raw:
+        return raw.strip()
+    parser = _HTMLText()
+    try:
+        parser.feed(raw)
+        parser.close()
+        text = "".join(parser.parts)
+    except Exception:  # malformed HTML: a crude tag strip beats a crash
+        text = re.sub(r"<[^>]+>", "\n", raw)
+    text = text.replace("\xa0", " ")
+    lines = [ln.strip() for ln in text.splitlines()]
+    out: List[str] = []
+    for ln in lines:
+        if ln:
+            out.append(ln)
+        elif out and out[-1]:
+            out.append("")
+    return "\n".join(out).strip()
+
+
+def strip_quoted_history(text: str) -> str:
+    """Cut at the first quoted-history marker (Outlook 'From:' block,
+    'On ... wrote:', '-----Original Message-----'). Keeps the lead's new
+    content + signature, drops our own quoted thread so classification
+    runs on what the lead actually wrote. Never cuts to nothing."""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if any(m.match(ln) for m in QUOTE_MARKERS):
+            head = "\n".join(lines[:i]).strip()
+            if head:
+                return head
+    return text
+
+
+def extract_body(activity: Dict[str, Any], preferred_field: str) -> str:
+    candidates = [preferred_field] + [f for f in BODY_FIELD_CANDIDATES if f != preferred_field]
+    for key in candidates:
+        val = activity.get(key)
+        if isinstance(val, str) and val.strip():
+            text = strip_quoted_history(html_to_text(val))
+            if text:
+                return text
+    return ""
+
+
+def fetch_body_from_inbox(activity: Dict[str, Any], api_key: str) -> str:
+    """Last-resort fallback: pull the conversation and find this activity's
+    message. Mirrors the team-inbox API the Cowork sweep uses
+    (get_inbox_conversation, keyed by ctc_ contact id). The REST path is
+    unverified against public docs (VERIFY on first live use, same
+    convention as activity_field_map), so every failure degrades to ''
+    (extraction-failed row) instead of raising."""
+    contact_id = ""
+    for key in ("contactId", "leadId", "_contact", "contact"):
+        v = activity.get(key)
+        if isinstance(v, str) and v.startswith("ctc_"):
+            contact_id = v
+            break
+    if not contact_id:
+        return ""
+    act_id = str(activity.get("_id") or activity.get("id") or "")
+    for path in (f"/inbox/conversations/{contact_id}", f"/contacts/{contact_id}/conversation"):
+        try:
+            data = lemlist_get(path, api_key, {"limit": 50})
+        except RuntimeError:
+            continue
+        msgs = data.get("activities") if isinstance(data, dict) else data
+        if not isinstance(msgs, list):
+            continue
+        fallback = ""
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            body = next((m[k] for k in BODY_FIELD_CANDIDATES
+                         if isinstance(m.get(k), str) and m[k].strip()), "")
+            if not body:
+                continue
+            text = strip_quoted_history(html_to_text(body))
+            if not text:
+                continue
+            if act_id and str(m.get("id") or m.get("_id") or "") == act_id:
+                return text
+            if m.get("type") in ("emailsReplied", "linkedinReplied") and not fallback:
+                fallback = text
+        if fallback:
+            return fallback
+    return ""
 
 
 # --------- Step 0: discover in-scope campaigns ---------
@@ -203,6 +344,12 @@ def pull_replies(cfg: Dict[str, Any], api_key: str, lookback_hours: float) -> Li
                     ts = None
                 if ts and ts < since:
                     continue
+                # IL-36: layered body extraction, never classify a blank.
+                body_text = extract_body(a, f_text)
+                extraction = "payload"
+                if not body_text:
+                    body_text = fetch_body_from_inbox(a, api_key)
+                    extraction = "inbox-fallback" if body_text else "failed"
                 out.append({
                     "reply_id": str(a.get(f_id) or ""),
                     "campaign_id": camp["id"],
@@ -213,7 +360,8 @@ def pull_replies(cfg: Dict[str, Any], api_key: str, lookback_hours: float) -> Li
                     "lead_title": a.get("leadJobTitle") or "",
                     "lead_company": a.get("leadCompanyName") or camp.get("account", ""),
                     "lead_country": "",
-                    "original_text": a.get(f_text) or a.get("body") or "",
+                    "original_text": body_text,
+                    "extraction": extraction,
                     "received_at": created,
                     "thread_history": "",
                     "_raw": a,
@@ -222,13 +370,34 @@ def pull_replies(cfg: Dict[str, Any], api_key: str, lookback_hours: float) -> Li
 
 
 # --------- Step 2: dedup against Replies DB ---------
+# Dedup key is the Lemlist activity id stored in the "Activity ID" rich_text property
+# (added 2026-06-11). Titles follow the human convention R-YYYY-MM-DD-NNN and are NOT
+# stable dedup keys. Fallback title check kept for rows created before 2026-06-11.
 
 def reply_exists(replies_db: str, reply_id: str, token: str) -> bool:
+    data = _request(
+        f"{NOTION_API}/databases/{replies_db}/query", notion_headers(token), "POST",
+        {"filter": {"property": "Activity ID", "rich_text": {"equals": reply_id}}, "page_size": 1},
+    )
+    if data.get("results"):
+        return True
     data = _request(
         f"{NOTION_API}/databases/{replies_db}/query", notion_headers(token), "POST",
         {"filter": {"property": "Reply ID", "title": {"equals": reply_id}}, "page_size": 1},
     )
     return bool(data.get("results"))
+
+
+def next_reply_title(replies_db: str, token: str, received_at: str) -> str:
+    """R-YYYY-MM-DD-NNN, NNN = count of same-day rows + 1 (date from the reply's received_at)."""
+    day = (received_at or "")[:10] or time.strftime("%Y-%m-%d")
+    prefix = f"R-{day}-"
+    data = _request(
+        f"{NOTION_API}/databases/{replies_db}/query", notion_headers(token), "POST",
+        {"filter": {"property": "Reply ID", "title": {"starts_with": prefix}}, "page_size": 100},
+    )
+    n = len(data.get("results") or []) + 1
+    return f"{prefix}{n:03d}"
 
 
 def find_lead(leads_db: str, email: str, token: str) -> Optional[str]:
@@ -244,21 +413,34 @@ def find_lead(leads_db: str, email: str, token: str) -> Optional[str]:
 
 # --------- Step 4: write Replies DB row ---------
 
-def write_reply_row(cfg: Dict[str, Any], reply: Dict[str, Any], c: Classification,
+EXTRACTION_FAILED_NOTE = (
+    "extraction-failed, needs manual fetch (IL-36): activity body empty after "
+    "HTML extraction + inbox fallback. Fetch the conversation in Lemlist, "
+    "paste the reply into Original reply, then classify at Gate 5. "
+    "NOT classified by design: a blank body is a fetch failure, not a bucket."
+)
+
+
+def write_reply_row(cfg: Dict[str, Any], reply: Dict[str, Any], c: Optional[Classification],
                     lead_page_id: Optional[str], token: str) -> str:
+    """c=None means extraction failed: the row carries no Classification
+    bucket, only the manual-fetch note (IL-36 design rule)."""
     def rt(text: str) -> Dict[str, Any]:
         return {"rich_text": [{"type": "text", "text": {"content": text[:1900]}}]}
 
+    title = next_reply_title(cfg["replies_db"], token, reply.get("received_at") or "")
     props: Dict[str, Any] = {
-        "Reply ID": {"title": [{"type": "text", "text": {"content": reply["reply_id"]}}]},
+        "Reply ID": {"title": [{"type": "text", "text": {"content": title}}]},
+        "Activity ID": rt(reply["reply_id"]),
         "Channel": {"select": {"name": reply["channel"]}},
-        "Classification": {"select": {"name": c.classification}},
-        "Classification reasoning": rt(c.reasoning),
+        "Classification reasoning": rt(EXTRACTION_FAILED_NOTE if c is None else c.reasoning),
         "Original reply": rt(reply["original_text"]),
-        "Gate 5 Decision": {"select": {"name": "Critical-Escalated" if c.classification == "Critical" else "Pending"}},
+        "Gate 5 Decision": {"select": {"name": "Critical-Escalated" if c is not None and c.classification == "Critical" else "Pending"}},
     }
-    if c.safety_flags:
-        props["Safety flags"] = {"multi_select": [{"name": f} for f in sorted(set(c.safety_flags))]}
+    if c is not None:
+        props["Classification"] = {"select": {"name": c.classification}}
+        if c.safety_flags:
+            props["Safety flags"] = {"multi_select": [{"name": f} for f in sorted(set(c.safety_flags))]}
     if reply.get("received_at"):
         props["Received at"] = {"date": {"start": reply["received_at"]}}
     if lead_page_id:
@@ -269,6 +451,16 @@ def write_reply_row(cfg: Dict[str, Any], reply: Dict[str, Any], c: Classificatio
         "properties": props,
     })
     return data.get("id", "")
+
+
+def set_telegram_flag(page_id: str, token: str) -> None:
+    """IL-36 part 2: the 'Telegram alert sent' checkbox is set in the same
+    pass that sends the alert, never assumed."""
+    try:
+        _request(f"{NOTION_API}/pages/{page_id}", notion_headers(token), "PATCH",
+                 {"properties": {"Telegram alert sent": {"checkbox": True}}})
+    except RuntimeError as e:
+        print(f"[warn] could not set Telegram flag on {page_id}: {e}", file=sys.stderr)
 
 
 # --------- Step 5: Telegram ---------
@@ -309,6 +501,8 @@ def run(dry_run: bool) -> int:
     synth_prefix = cfg.get("synthetic_prefix", "R-2026-05-19")
     new_count = critical_count = 0
     summary_lines: List[str] = []
+    run_pages: List[str] = []     # rows written this run (for the summary-alert flag)
+    flagged: set = set()          # rows already flagged via a Critical alert
 
     for reply in replies:
         if reply["reply_id"].startswith(synth_prefix):
@@ -316,29 +510,38 @@ def run(dry_run: bool) -> int:
         if not dry_run and reply_exists(cfg["replies_db"], reply["reply_id"], notion_token):
             continue
 
-        c = classify(reply, api_key=anthropic_key,
-                     competitor_names=cfg.get("competitor_names", []))
+        # IL-36: a blank body after all extraction layers is a fetch
+        # failure, never a classification input.
+        c: Optional[Classification] = None
+        if reply.get("extraction") != "failed":
+            c = classify(reply, api_key=anthropic_key,
+                         competitor_names=cfg.get("competitor_names", []))
         new_count += 1
 
         if dry_run:
             print(json.dumps({
                 "reply_id": reply["reply_id"], "campaign": reply["campaign_name"],
                 "lead": reply["lead_name"] or reply["lead_email"],
-                "classification": c.classification, "flags": c.safety_flags,
-                "reasoning": c.reasoning,
+                "extraction": reply.get("extraction"),
+                "classification": c.classification if c else "EXTRACTION-FAILED",
+                "flags": c.safety_flags if c else [],
+                "reasoning": c.reasoning if c else EXTRACTION_FAILED_NOTE,
                 "_raw_keys": sorted((reply.get("_raw") or {}).keys()),
             }, ensure_ascii=False, indent=1))
             continue
 
         lead_page = find_lead(cfg["leads_db"], reply["lead_email"], notion_token)
         page_id = write_reply_row(cfg, reply, c, lead_page, notion_token)
-        line = f"{c.classification}: {reply['lead_name'] or reply['lead_email']} ({reply['campaign_name']})"
+        label = c.classification if c else "Extraction-FAILED"
+        line = f"{label}: {reply['lead_name'] or reply['lead_email']} ({reply['campaign_name']})"
         summary_lines.append(line)
+        if page_id:
+            run_pages.append(page_id)
         print(f"[ok] {reply['reply_id']} -> {page_id} [{line}]", file=sys.stderr)
 
-        if c.classification == "Critical":
+        if c is not None and c.classification == "Critical":
             critical_count += 1
-            telegram_send(
+            sent = telegram_send(
                 "🚨 CRITICAL reply (Agent 5 always-on)\n"
                 f"Lead: {reply['lead_name'] or reply['lead_email']}\n"
                 f"Campaign: {reply['campaign_name']}\n"
@@ -346,15 +549,53 @@ def run(dry_run: bool) -> int:
                 f"Reply: {reply['original_text'][:400]}\n"
                 "No action taken (policy: alert only). Review in the Replies DB / Gate 5."
             )
+            if sent and page_id:
+                set_telegram_flag(page_id, notion_token)
+                flagged.add(page_id)
 
     if not dry_run and new_count:
-        telegram_send(
+        sent = telegram_send(
             f"Agent 5 always-on run: {new_count} new repl{'y' if new_count == 1 else 'ies'}, "
             f"{critical_count} critical.\n" + "\n".join(summary_lines[:10])
         )
+        if sent:
+            for pid in run_pages:
+                if pid not in flagged:
+                    set_telegram_flag(pid, notion_token)
     print(json.dumps({"new_replies": new_count, "critical": critical_count, "dry_run": dry_run}))
     return 0
 
 
+# --------- Extraction selftest (golden payload, IL-36) ---------
+
+def selftest_extraction() -> int:
+    """Runs the layered extraction against the EXACT live payload that
+    caused IL-36 (act_RTXdot9Twnih7jzYz, Outlook-mobile HTML, fetched from
+    the Lemlist conversation 2026-06-12) plus the degenerate cases.
+    No network. python3 main.py --selftest"""
+    fixture = os.path.join(HERE, "fixtures", "outlook-mobile-reply.html")
+    with open(fixture, encoding="utf-8") as f:
+        act = {"text": "", "message": f.read(), "_id": "act_RTXdot9Twnih7jzYz"}
+    text = extract_body(act, "text")
+    checks = [
+        ("starts with the lead's new content", text.startswith("Yes")),
+        ("keeps the ask", "Give me three slots the week after next" in text),
+        ("keeps the lead's signature block", "Nicolas Steinberg" in text),
+        ("drops the quoted thread", "Quick context on the segmentation question" not in text),
+        ("no html left", "<" not in text and ">" not in text),
+        ("plain text passes through", extract_body({"text": "Yes, works for me"}, "text") == "Yes, works for me"),
+        ("blank everything -> '' (extraction-failed path)", extract_body({"text": "  ", "message": ""}, "text") == ""),
+        ("quote-strip never cuts to nothing", strip_quoted_history("From: someone@x.com\nhello") != ""),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"[{'ok' if passed else 'FAIL'}] {name}")
+        ok = ok and passed
+    print(json.dumps({"selftest": "extraction", "passed": ok}))
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest_extraction())
     sys.exit(run("--dry-run" in sys.argv))
