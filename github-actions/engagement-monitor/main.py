@@ -82,7 +82,24 @@ def _request(url: str, headers: Dict[str, str], method: str = "GET",
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+            # A 2xx with an empty body (e.g. 204, or an empty inbox response) is
+            # not an error: return None and let callers degrade. fetch_body_from_inbox
+            # already treats a non-dict/None result as "no body".
+            if not raw:
+                return None
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                # 2xx but the body is not JSON (empty-ish, HTML, Cloudflare splash).
+                # Retry once or twice, then raise a CATCHABLE RuntimeError instead of
+                # a bare JSONDecodeError, so callers that already guard RuntimeError
+                # (fetch_body_from_inbox) degrade gracefully instead of crashing the run.
+                last = f"non-JSON body (len {len(raw)}): {raw[:200]}"
+                if attempt < retries:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"{method} {url} returned non-JSON after retries: {last}")
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
             if e.code in (429, 500, 502, 503, 504):
