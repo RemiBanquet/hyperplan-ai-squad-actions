@@ -226,10 +226,12 @@ def extract_body(activity: Dict[str, Any], preferred_field: str) -> str:
 def fetch_body_from_inbox(activity: Dict[str, Any], api_key: str) -> str:
     """Last-resort fallback: pull the conversation and find this activity's
     message. Mirrors the team-inbox API the Cowork sweep uses
-    (get_inbox_conversation, keyed by ctc_ contact id). The REST path is
-    unverified against public docs (VERIFY on first live use, same
-    convention as activity_field_map), so every failure degrades to ''
-    (extraction-failed row) instead of raising."""
+    (get_inbox_conversation, keyed by ctc_ contact id). REST path verified
+    2026-06-19 against the lemlist OpenAPI catalog: GET /api/inbox/{contactId}
+    (the endpoint that backs the get_inbox_conversation MCP tool). The two
+    earlier guessed paths (/inbox/conversations/{id}, /contacts/{id}/conversation)
+    did not exist and returned non-JSON, which is what tripped IL (the _request
+    JSON guard). Every failure still degrades to '' (extraction-failed row)."""
     contact_id = ""
     for key in ("contactId", "leadId", "_contact", "contact"):
         v = activity.get(key)
@@ -239,7 +241,7 @@ def fetch_body_from_inbox(activity: Dict[str, Any], api_key: str) -> str:
     if not contact_id:
         return ""
     act_id = str(activity.get("_id") or activity.get("id") or "")
-    for path in (f"/inbox/conversations/{contact_id}", f"/contacts/{contact_id}/conversation"):
+    for path in (f"/inbox/{contact_id}",):
         try:
             data = lemlist_get(path, api_key, {"limit": 50})
         except RuntimeError:
